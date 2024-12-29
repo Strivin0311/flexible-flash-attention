@@ -543,11 +543,48 @@ def test_flash_attn_varlen_output(
         assert (dv - dv_ref).abs().max().item() < 1e-4 or (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
 
 
-def get_mask_from_ranges(q_ranges, k_ranges, q_len, k_len):
+def get_mask_from_ranges(
+    q_ranges, k_ranges, 
+    q_len, k_len,
+    causal_mask: list[int] | str = 'all_full',
+):
     bsz = q_ranges.shape[0]
     mask = torch.zeros((q_len, k_len), device='cuda', dtype=torch.bool)
+    if causal_mask == 'all_full':
+        causal_mask = [0] * bsz
+    elif causal_mask == 'all_causal':
+        causal_mask = [1] * bsz
+    
     for i in range(bsz):
-        mask[q_ranges[i, 0]:q_ranges[i, 1], k_ranges[i, 0]:k_ranges[i, 1]] = True
+        sq = q_ranges[i, 1] - q_ranges[i, 0]
+        sk = k_ranges[i, 1] - k_ranges[i, 0]
+        
+        if causal_mask[i] == 0: # full
+            local_mask = torch.ones((sq, sk)).to(torch.bool)
+        elif causal_mask[i] == 1: # causal
+            # a1: align to top-left
+            sq_start, sq_end = 0, sq
+            sk_start, sk_end = 0, sk
+            
+            # a2: align to bottom-right
+            # s = max(sq, sk)
+            # sq_start, sq_end = s - sq, s
+            # sk_start, sk_end = s - sk, s
+            
+            # a3: no alignment, use the global idx
+            # sq_start, sq_end = q_ranges[i, 0], q_ranges[i, 1]
+            # sk_start, sk_end = k_ranges[i, 0], k_ranges[i, 1]
+            
+            qi = torch.arange(sq_start, sq_end).view(-1, 1)  # [sq, 1]
+            kj = torch.arange(sk_start, sk_end).view(1, -1)  # [1, sk]
+            
+            local_mask = qi >= kj
+            
+        mask[
+            q_ranges[i, 0]:q_ranges[i, 1],
+            k_ranges[i, 0]:k_ranges[i, 1],
+        ].copy_(local_mask)
+    
     return mask
 
 
@@ -628,49 +665,93 @@ def generate_qk_ranges(seqlen_q, seqlen_k, bsz, device='cuda'):
     
     return q_ranges, k_ranges, max_seqlen_q, max_seqlen_k
 
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+
+def generate_is_causal_mapping(
+    bsz,
+    causal_mask: list[int] | str = 'all_full',
+    device='cuda',
+):
+    supported_patterns = ['all_full', 'all_causal']
+    
+    assert causal_mask in supported_patterns or (causal_mask is not None and len(causal_mask) == bsz), \
+        f"When mode is `custom`, the causal mask as a list of length ({bsz}) should be provided"
+    
+    if causal_mask == 'all_full':
+        is_causal_mapping = torch.zeros((bsz,))
+    elif causal_mask == 'all_causal':
+        is_causal_mapping = torch.ones((bsz,))
+    else:
+        is_causal_mapping = torch.tensor(causal_mask)
+        
+    return is_causal_mapping.to(torch.bool).to(device)
+
+
+@pytest.mark.parametrize("mha_type", ["mha"]) # FIXME: not support "mqa", "gqa" now
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
-@pytest.mark.parametrize("seqlen_q", [8, 256, 551, 1234, 1999]) # hang when seqlen is smaller than 7
-@pytest.mark.parametrize("seqlen_k", [8, 256, 551, 1234]) # hang when seqlen is smaller than 7
-@pytest.mark.parametrize("bsz", [1, 8])                       
+@pytest.mark.parametrize("seqlen_q", [8, 256, 551, 1234, 1999]) # FIXME: hang when seqlen is smaller than 7
+@pytest.mark.parametrize("seqlen_k", [8, 256, 551, 1234]) # FIXME: hang when seqlen is smaller than 7
+@pytest.mark.parametrize("bsz", [1, 8])
+@pytest.mark.parametrize("nheads", [6])
+@pytest.mark.parametrize("causal_mask", ['all_full']) # choose from ['all_full', 'all_causal', [1,0,0,1,...]]
 def test_flex_flash_attn_output(
-    seqlen_q, 
-    seqlen_k, 
-    bsz,
-    d,
-    mha_type, 
-    dtype
+    seqlen_q: int, 
+    seqlen_k: int, 
+    bsz: int,
+    d: int,
+    nheads: int,
+    mha_type: str,
+    dtype: torch.dtype,
+    causal_mask: list[int] | str,
+    device: str = 'cuda',
+    seed: int = 42,
+    is_test_bwd: bool = False, # FIXME: not support bwd now
 ):
-    device = 'cuda'
-    torch.random.manual_seed(42)
+    torch.random.manual_seed(seed)
 
     q_ranges, k_ranges, max_seqlen_q, max_seqlen_k = generate_qk_ranges(seqlen_q * bsz, seqlen_k * bsz, bsz, device)
-
-    # print(f"q_ranges: {q_ranges}, k_ranges: {k_ranges}, max_seqlen_q: {max_seqlen_q}, max_seqlen_k: {max_seqlen_k}")
     
-    nheads = 6
-    nheads_kv = 6 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
-    q = torch.randn(bsz * seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(bsz * seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(bsz * seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    is_causal_mapping = generate_is_causal_mapping(bsz, causal_mask=causal_mask, device=device)
+    ref_mask = get_mask_from_ranges(q_ranges, k_ranges, seqlen_q * bsz, seqlen_k * bsz, causal_mask=causal_mask)
+
+    # print(f"{q_ranges=}\n{k_ranges=}\n{max_seqlen_q=}\n{max_seqlen_k=}\n{is_causal_mapping=}\n{ref_mask=}")
+    
+    # nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1) # FIXME: only support mha now
+    q = torch.randn(bsz * seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=is_test_bwd)
+    k = torch.randn(bsz * seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=is_test_bwd)
+    v = torch.randn(bsz * seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=is_test_bwd)
     g = torch.randn(bsz * seqlen_q, nheads, d, device=device, dtype=dtype)
 
-    out, _ = flex_flash_attn_func(q, k, v, q_ranges, k_ranges, max_seqlen_q, max_seqlen_k, softmax_scale=None, deterministic=False)
-    out.backward(g)
-    dq, dk, dv = q.grad, k.grad, v.grad
-    q.grad, k.grad, v.grad = None, None, None
+    out, _ = flex_flash_attn_func(
+        q, k, v, 
+        q_ranges, k_ranges,
+        is_causal_mapping,
+        max_seqlen_q, max_seqlen_k, 
+        softmax_scale=None, 
+        deterministic=False,
+    )
+    if is_test_bwd:
+        out.backward(g)
+        dq, dk, dv = q.grad, k.grad, v.grad
+        q.grad, k.grad, v.grad = None, None, None
 
-    out_ref = torch_attn_ref(q, k, v, mask=get_mask_from_ranges(q_ranges, k_ranges, seqlen_q * bsz, seqlen_k * bsz), layout="thd", high_precision=True)
-    out_ref.backward(g)
-    dq_ref, dk_ref, dv_ref = q.grad, k.grad, v.grad
-    q.grad, k.grad, v.grad = None, None, None
+    out_ref = torch_attn_ref(
+        q, k, v, 
+        mask=ref_mask,
+        layout="thd",
+        high_precision=True,
+    )
+    if is_test_bwd:
+        out_ref.backward(g)
+        dq_ref, dk_ref, dv_ref = q.grad, k.grad, v.grad
+        q.grad, k.grad, v.grad = None, None, None
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     elsit = []
     print("\n", flush=True)
     print(f"=========================START=========================", flush=True)
+    
     try:
         torch.testing.assert_close(out, out_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
     except Exception as e:
@@ -679,31 +760,149 @@ def test_flex_flash_attn_output(
         print(e, flush=True)
         print(f"---------------------------End Out check---------------------------", flush=True)
         elsit.append(e)
-    try:
-        torch.testing.assert_close(dq, dq_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
-    except Exception as e:
-        print(f"---------------------------Start dq check---------------------------", flush=True)
-        print(f"Failed dq check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
-        print(e, flush=True)
-        print(f"---------------------------End dq check---------------------------", flush=True)
-        elsit.append(e)
-    try:
-        torch.testing.assert_close(dk, dk_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
-    except Exception as e:
-        print(f"---------------------------Start dk check---------------------------", flush=True)
-        print(f"Failed dk check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
-        print(e, flush=True)
-        print(f"---------------------------End dk check---------------------------", flush=True)
-        elsit.append(e)
-    try:
-        torch.testing.assert_close(dv, dv_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
-    except Exception as e:
-        print(f"---------------------------Start dv check---------------------------", flush=True)
-        print(f"Failed dv check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
-        print(e, flush=True)
-        print(f"---------------------------End dv check---------------------------", flush=True)
-        elsit.append(e)
+    
+    if is_test_bwd:
+        try:
+            torch.testing.assert_close(dq, dq_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
+        except Exception as e:
+            print(f"---------------------------Start dq check---------------------------", flush=True)
+            print(f"Failed dq check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
+            print(e, flush=True)
+            print(f"---------------------------End dq check---------------------------", flush=True)
+            elsit.append(e)
+        
+        try:
+            torch.testing.assert_close(dk, dk_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
+        except Exception as e:
+            print(f"---------------------------Start dk check---------------------------", flush=True)
+            print(f"Failed dk check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
+            print(e, flush=True)
+            print(f"---------------------------End dk check---------------------------", flush=True)
+            elsit.append(e)
+        
+        try:
+            torch.testing.assert_close(dv, dv_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
+        except Exception as e:
+            print(f"---------------------------Start dv check---------------------------", flush=True)
+            print(f"Failed dv check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
+            print(e, flush=True)
+            print(f"---------------------------End dv check---------------------------", flush=True)
+            elsit.append(e)
+    
     print(f"=========================END=========================", flush=True)
 
     for e in elsit:
         raise e
+    if not elsit:
+        print("All passed! ✅", flush=True)
+        
+        
+@pytest.mark.parametrize("mha_type", ["mha"]) # FIXME: not support "mqa", "gqa" now
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("seqlen", [8, 256, 551, 1234]) # FIXME: hang when seqlen is smaller than 7
+@pytest.mark.parametrize("bsz", [1, 8])
+@pytest.mark.parametrize("nheads", [6])
+@pytest.mark.parametrize("causal_mask", ['all_causal']) # choose from ['all_full', 'all_causal', [1,0,0,1,...]]
+def test_flex_flash_attn_varlen_output(
+    seqlen: int,
+    bsz: int,
+    d: int,
+    nheads: int,
+    mha_type: str,
+    dtype: torch.dtype,
+    causal_mask: list[int] | str,
+    device: str = 'cuda',
+    seed: int = 42,
+    is_test_bwd: bool = False, # FIXME: not support bwd now
+):
+    torch.random.manual_seed(seed)
+
+    seqlen_q = seqlen_k = seqlen # FIXME: hack to be varlen, i.e. total_seqlen_q = total_seqlen_k
+    q_ranges, k_ranges, max_seqlen_q, max_seqlen_k = generate_qk_ranges(seqlen_q * bsz, seqlen_k * bsz, bsz, device)
+    k_ranges, max_seqlen_k = q_ranges.clone(), max_seqlen_q # FIXME: hack to be varlen, i.e. q_ranges = k_ranges = cu_seqlens_q = cu_seqlens_k
+    
+    is_causal_mapping = generate_is_causal_mapping(bsz, causal_mask=causal_mask, device=device)
+    ref_mask = get_mask_from_ranges(q_ranges, k_ranges, seqlen_q * bsz, seqlen_k * bsz, causal_mask=causal_mask)
+
+    # print(f"{q_ranges=}\n{k_ranges=}\n{max_seqlen_q=}\n{max_seqlen_k=}\n{is_causal_mapping=}\n{ref_mask=}")
+    
+    # nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1) # FIXME: only support mha now
+    q = torch.randn(bsz * seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=is_test_bwd)
+    k = torch.randn(bsz * seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=is_test_bwd)
+    v = torch.randn(bsz * seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=is_test_bwd)
+    g = torch.randn(bsz * seqlen_q, nheads, d, device=device, dtype=dtype)
+
+    out, _ = flex_flash_attn_func(
+        q, k, v, 
+        q_ranges, k_ranges,
+        is_causal_mapping,
+        max_seqlen_q, max_seqlen_k, 
+        softmax_scale=None, 
+        deterministic=False,
+    )
+    if is_test_bwd:
+        out.backward(g)
+        dq, dk, dv = q.grad, k.grad, v.grad
+        q.grad, k.grad, v.grad = None, None, None
+
+    out_ref = torch_attn_ref(
+        q, k, v, 
+        mask=ref_mask,
+        layout="thd",
+        high_precision=True,
+    )
+    if is_test_bwd:
+        out_ref.backward(g)
+        dq_ref, dk_ref, dv_ref = q.grad, k.grad, v.grad
+        q.grad, k.grad, v.grad = None, None, None
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    elsit = []
+    print("\n", flush=True)
+    print(f"=========================START=========================", flush=True)
+    
+    try:
+        torch.testing.assert_close(out, out_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
+    except Exception as e:
+        print(f"---------------------------Start Out check---------------------------", flush=True)
+        print(f"Failed out check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
+        print(e, flush=True)
+        print(f"---------------------------End Out check---------------------------", flush=True)
+        elsit.append(e)
+    
+    if is_test_bwd:
+        try:
+            torch.testing.assert_close(dq, dq_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
+        except Exception as e:
+            print(f"---------------------------Start dq check---------------------------", flush=True)
+            print(f"Failed dq check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
+            print(e, flush=True)
+            print(f"---------------------------End dq check---------------------------", flush=True)
+            elsit.append(e)
+        
+        try:
+            torch.testing.assert_close(dk, dk_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
+        except Exception as e:
+            print(f"---------------------------Start dk check---------------------------", flush=True)
+            print(f"Failed dk check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
+            print(e, flush=True)
+            print(f"---------------------------End dk check---------------------------", flush=True)
+            elsit.append(e)
+        
+        try:
+            torch.testing.assert_close(dv, dv_ref, atol=torch.finfo(dtype).eps, rtol=torch.finfo(dtype).eps)
+        except Exception as e:
+            print(f"---------------------------Start dv check---------------------------", flush=True)
+            print(f"Failed dv check for mha_type: {mha_type}, dtype: {dtype}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, bsz: {bsz}", flush=True)
+            print(e, flush=True)
+            print(f"---------------------------End dv check---------------------------", flush=True)
+            elsit.append(e)
+    
+    print(f"=========================END=========================", flush=True)
+
+    for e in elsit:
+        raise e
+    if not elsit:
+        print("All passed! ✅", flush=True)
